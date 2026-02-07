@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ArXiv Citation Extractor (pure client‑side)</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;background:#fafafa;color:#333;margin:0;padding:0;}
+  .wrapper{max-width:720px;margin:auto;padding:1rem;}
+  h1{font-size:1.4rem;margin-bottom:.5rem;}
+  .dropzone{
+    border:2px dashed #bbb;padding:2rem;text-align:center;background:#fff;
+    cursor:pointer;transition:background .2s,border-color .2s;
+  }
+  .dropzone.hover{border-color:#2a9d8f;background:#f0fdfa;}
+  .status{margin-top:.5rem;font-size:.9rem;color:#555;}
+  .btn{
+    display:inline-block;margin-top:.8rem;padding:.6rem 1.2rem;
+    background:#264653;color:#fff;border:none;border-radius:4px;
+    cursor:pointer;text-decoration:none;
+  }
+  .btn:disabled{background:#bbb;cursor:not-allowed;}
+  .download{margin-top:1rem;}
+</style>
+
+<!-- External libraries (all served from a CDN – no bundling needed) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.0/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/string-similarity/4.0.4/string-similarity.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/franc/6.1.0/franc.min.js"></script>
+</head>
+
+<body>
+<div class="wrapper">
+  <h1>ArXiv Citation Extractor (pure client‑side)</h1>
+
+  <div id="zone" class="dropzone">
+    Drag &amp; drop your <strong>.zip</strong> here<br>or click to browse
+    <input type="file" id="fileInput" accept=".zip" style="display:none">
+  </div>
+
+  <div id="status" class="status"></div>
+  <div id="download" class="download"></div>
+</div>
+
+<script>
+/* -----------------------------------------------------------------
+   EVERYTHING FROM THIS POINT ONWARDS IS THE SAME JavaScript that
+   you received in the previous answer.  No changes are required –
+   just paste it verbatim.
+   ----------------------------------------------------------------- */
+
+/* ---------- CONFIG ------------------------------------------------- */
+const PDF_MAX_PAGES = 12;      // we only need the first few pages for ID, title, abstract, etc.
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.js';
+
+/* ---------- UI SET‑UP -------------------------------------------- */
+const zone   = document.getElementById('zone');
+const status = document.getElementById('status');
+const downloadDiv = document.getElementById('download');
+const fileInput = document.getElementById('fileInput');
+
+zone.onclick = () => fileInput.click();
+zone.ondragover = e => { e.preventDefault(); zone.classList.add('hover'); };
+zone.ondragleave = () => zone.classList.remove('hover');
+zone.ondrop = e => {
+  e.preventDefault(); zone.classList.remove('hover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+};
+fileInput.onchange = () => { if (fileInput.files.length) handleFile(fileInput.files[0]); };
+
+/* ---------- MAIN ENTRY POINT ------------------------------------- */
+async function handleFile(file){
+  if (!file.name.toLowerCase().endsWith('.zip')){
+    alert('Please upload a .zip file'); return;
+  }
+  status.textContent = `Reading ${file.name}…`;
+  downloadDiv.innerHTML = '';      // clear any previous result
+
+  try{
+    const zip = await JSZip.loadAsync(file);
+    const {pdfFile, htmlFile, xmlFile, apiFile} = locateFiles(zip);
+    if (!pdfFile || !htmlFile || !xmlFile){
+      throw new Error('The zip must contain a PDF, an HTML (or HTM) file and a scraping XML file.');
+    }
+
+    /* ----- 1️⃣  Extract raw content from each source ----- */
+    const pdfText   = await extractPdfText(pdfFile);
+    const htmlText  = await zip.file(htmlFile).async('string');
+    const xmlText   = await zip.file(xmlFile).async('string');
+    const apiJson   = apiFile ? JSON.parse(await zip.file(apiFile).async('string')) : {};
+
+    /* ----- 2️⃣  Parse raw content into a small “model” ----- */
+    const pdfInfo   = parsePdfInfo(pdfText);
+    const htmlInfo  = parseHtmlInfo(htmlText);
+    const xmlInfo   = parseXmlInfo(xmlText);
+
+    /* ----- 3️⃣  Validate ARXIV ID & VERSION across the three sources ----- */
+    const idCheck = validateIdVersion(pdfInfo, htmlInfo, xmlInfo);
+    if (!idCheck.ok){
+      const hold = {hold_reason:idCheck.reason};
+      triggerDownload(JSON.stringify(hold, null,2), 'hold.json','application/json');
+      return;
+    }
+
+    /* ----- 4️⃣  Title (most‑complete / semantic‑mismatch rule) ----- */
+    const title = selectTitle(pdfInfo.title, htmlInfo.title);
+
+    /* ----- 5️⃣  Keywords (English‑only, proper separators) ----- */
+    const keywords = extractKeywords(pdfInfo.keywords || htmlInfo.keywords || '');
+
+    /* ----- 6️⃣  Authors – merge PDF list with optional API list ----- */
+    const authors = mergeAuthors(pdfInfo.authors || [], apiJson.authors || []);
+
+    /* ----- 7️⃣  Affiliations – simple structural split ----- */
+    const affiliations = normaliseAffiliations(pdfInfo.affiliations || []);
+
+    /* ----- 8️⃣  Abstract – placeholders for formulas/figures/tables ----- */
+    const abstract = cleanAbstract(pdfInfo.abstract || htmlInfo.abstract || '',
+                                 apiJson.abstract_hint || '');
+
+    /* ----- 9️⃣  References – strip hyperlinks, split multiples ----- */
+    const references = parseReferences(pdfInfo.references || '');
+
+    /* ----- 🔟  Correspondence detection (asterisk / envelope) ----- */
+    const correspondence = detectCorrespondence(authors, pdfInfo, htmlInfo, apiJson);
+
+    /* ----- 11️⃣  Build final RED‑compatible XML ------------------- */
+    const citationXml = buildCitationXml({
+      id: pdfInfo.arxivId,
+      version: pdfInfo.version,
+      doi: xmlInfo.doi,
+      title,
+      keywords,
+      authors,
+      affiliations,
+      abstract,
+      references,
+      correspondence
+    });
+
+    /* ----- 12️⃣  Offer the XML file for download ------------------- */
+    triggerDownload(citationXml, 'citation.xml','application/xml');
+
+  }catch(err){
+    console.error(err);
+    status.textContent = `❌ Error: ${err.message}`;
+  }
+}
+
+/* -------------------------- Helper functions --------------------- */
+/* The following helper groups are *exactly* the same as the ones
+   you received in the previous answer.  For brevity they are kept
+   collapsed here – just paste them verbatim after the line
+   “// ----- 12️⃣  Offer the XML file for download -----”. */
+
+function locateFiles(zip){ /* … */ }
+function extractPdfText(pdfFile){ /* … */ }
+function parsePdfInfo(text){ /* … */ }
+function parseHtmlInfo(htmlStr){ /* … */ }
+function parseXmlInfo(xmlStr){ /* … */ }
+function validateIdVersion(pdf, html, xml){ /* … */ }
+function selectTitle(pdfTitle, htmlTitle){ /* … */ }
+function extractKeywords(raw){ /* … */ }
+function mergeAuthors(pdfAuthors, apiAuthors){ /* … */ }
+function normaliseAffiliations(rawAffList){ /* … */ }
+function cleanAbstract(raw, apiHint){ /* … */ }
+function parseReferences(raw){ /* … */ }
+function detectCorrespondence(authors, pdfInfo, htmlInfo, apiJson){ /* … */ }
+function buildCitationXml(data){ /* … */ }
+function triggerDownload(content, filename, mime){
+  const blob = new Blob([content],{type:mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.textContent = `Download ${filename}`;
+  a.className = 'btn';
+  downloadDiv.innerHTML = ''; downloadDiv.appendChild(a);
+}
+</script>
+</body>
+</html>
